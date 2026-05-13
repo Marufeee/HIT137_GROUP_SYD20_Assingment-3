@@ -549,3 +549,171 @@ class SpotTheDifferenceView:
 
     def _on_modified_click(self, event: tk.Event) -> None:
         raise NotImplementedError
+
+
+"""
+Interaction logic, round flow, and executable app entry.
+
+
+- We subclass `SpotTheDifferenceView` and finally implement the three methods that were
+  stubbed out: load a file, handle clicks, reveal answers, show popups when you win or
+  run out of mistakes.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import cv2
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+from project_part2_17_5 import SpotTheDifferenceView
+
+
+class SpotTheDifferenceApp(SpotTheDifferenceView):
+    """
+    The playable app — same UI as the parent, but now buttons actually do things.
+    """
+
+    def load_image(self) -> None:
+        """
+        Open a file picker, then tell the engine to load + bake in 5 differences.
+
+        Order matters: set_mode first so load_and_generate uses Normal vs Easy 
+        If anything doesnt work (bad path, tiny image, couldn't place 5 boxes), we show
+        an error dialog and exit without half-updating the UI.
+        """
+        image_path = filedialog.askopenfilename(
+            title="Select an image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")],
+        )
+        if not image_path:
+            return
+
+        try:
+            self.engine.set_mode(self.mode_var.get())
+            self.engine.load_and_generate(image_path, total_differences=5)
+        except Exception as exc:
+            messagebox.showerror("Load Error", str(exc))
+            return
+
+        self.stats.reset_for_new_image()
+        self._can_guess = True
+        self.label_message.config(text=f"Loaded: {Path(image_path).name} ({self.engine.mode} Mode)")
+        self._redraw_images()
+        self._refresh_labels()
+
+    def _redraw_images(self) -> None:
+        """
+        Copy fresh pixels from the engine, draw circles on TOP for found/revealed spots,
+        then resize for display.
+
+        Why copy? We don't want to permanently draw circles on the engine's internal
+        arrays — those are the "source of truth" for the round. We only decorate for display.
+        """
+        original = self.engine.original.copy()
+        modified = self.engine.modified.copy()
+
+        for region in self.engine.regions:
+            cx, cy = region.center()
+            radius = int(max(region.w, region.h) * 0.55)
+            if region.found:
+                # BGR: red = (0,0,255) in OpenCV's backwards channel order
+                cv2.circle(original, (cx, cy), radius, (0, 0, 255), 2)
+                cv2.circle(modified, (cx, cy), radius, (0, 0, 255), 2)
+            elif region.revealed:
+                # Blue-ish for "you cheated / reveal button" — still BGR so (255,0,0) is blue
+                cv2.circle(original, (cx, cy), radius, (255, 0, 0), 2)
+                cv2.circle(modified, (cx, cy), radius, (255, 0, 0), 2)
+
+        self._display_original, self._display_modified = self._prepare_display_pair(original, modified)
+        self._draw_canvas_images()
+
+    def _on_modified_click(self, event: tk.Event) -> None:
+        """
+        Translate canvas click → image pixel, see if it hit a hidden region.
+
+        The `- 12` matches where we painted the image (offset from canvas edge). If you
+        ever change that offset in part 2's _draw_canvas_images, update it here too or
+        clicks will feel "off".
+        """
+        if not self.engine.regions or not self._can_guess or not self.stats.guesses_allowed():
+            return
+
+        img_x = int((event.x - 12) * self._scale_x)
+        img_y = int((event.y - 12) * self._scale_y)
+        if img_x < 0 or img_y < 0:
+            return
+
+        matched = False
+        for region in self.engine.regions:
+            if not region.found and region.contains_click(img_x, img_y):
+                region.found = True
+                self.stats.add_found()
+                matched = True
+                break
+
+        if matched:
+            self.label_message.config(text="Great! Difference found.")
+        else:
+            self.stats.add_mistake()
+            self.label_message.config(text="Missed! Try again.")
+
+        self._redraw_images()
+        self._refresh_labels()
+        self._check_end_conditions()
+
+    def _check_end_conditions(self) -> None:
+        """
+        Win: zero remaining unfound → popup + lock guesses.
+        Lose the round: 3 misses → popup with how many you got, lock guesses.
+
+        "Lock guesses" = _can_guess False so further clicks are ignored until new image.
+        """
+        remaining = sum(1 for r in self.engine.regions if not r.found)
+
+        if remaining == 0:
+            self._can_guess = False
+            self.label_message.config(text="All 5 differences found. Load another image!")
+            messagebox.showinfo("Round Complete", "Excellent! You found all 5 differences.")
+            return
+
+        if self.stats.mistakes >= self.stats.max_mistakes:
+            self._can_guess = False
+            found_count = 5 - remaining
+            self.label_message.config(text=f"Too many mistakes (3). Found {found_count}/5. Load new image.")
+            messagebox.showwarning(
+                "Too Many Mistakes",
+                f"You reached 3 mistakes.\nDifferences found: {found_count}/5\nLoad a new image to continue.",
+            )
+
+    def reveal_unfound(self) -> None:
+        """
+        Spoiler button: mark every still-hidden region as revealed, redraw with blue rings,
+        and stop counting further clicks as valid guesses.
+        """
+        if not self.engine.regions:
+            return
+
+        unrevealed = 0
+        for region in self.engine.regions:
+            if not region.found:
+                region.revealed = True
+                unrevealed += 1
+
+        self._can_guess = False
+        self._redraw_images()
+        self._refresh_labels()
+        self.label_message.config(text=f"Revealed {unrevealed} unfound differences. Load new image.")
+
+
+def main() -> None:
+    """Standard Tk entry: one root window, one app object, hand control to the event loop."""
+    root = tk.Tk()
+    app = SpotTheDifferenceApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
