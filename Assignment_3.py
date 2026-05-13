@@ -1,3 +1,14 @@
+"""
+How the code is organised (read top → bottom):
+    1) DifferenceRegion          — one hidden “spot” as a rectangle + found/reveal flags
+    2) DifferenceOperation + subclasses — OpenCV tricks that change a patch (OOP / polymorphism)
+    3) ImageDifferenceEngine     — load image, clone it, place 5 non-overlapping regions, apply ops
+    4) GameStats                  — mistakes + total found (kept separate from pixels on purpose)
+    5) SpotTheDifferenceView      — Tk window, labels, canvases, scaling + fullscreen resize logic
+    6) SpotTheDifferenceApp       — subclass: file picker, clicks, win/lose, reveal button
+    7) main()                     — boots Tk and starts the event loop
+"""
+
 from __future__ import annotations
 
 import random
@@ -13,10 +24,11 @@ from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox
 
 
-# DifferenceRegion — one rectangle where we hid a change
-# Each "spot the difference" spot is really just a box: top-left (x,y) and size (w,h).
-# We also track whether the player found it yet, or whether they hit "reveal" so we
-# can draw blue circles instead of red ones.
+# =============================================================================
+# SECTION 1 — DifferenceRegion (geometry + hit testing for one hidden spot)
+# =============================================================================
+# The game is really “five rectangles on the modified image”. Each DifferenceRegion stores
+# where that rectangle is and whether the player already found it or hit Reveal.
 
 
 @dataclass
@@ -29,16 +41,15 @@ class DifferenceRegion:
     revealed: bool = False
 
     def center(self) -> Tuple[int, int]:
-        """Middle of the box — handy when we want to draw a circle around the spot."""
+        """Pixel coords of the middle — we draw circles around here when you find/reveal."""
         return (self.x + self.w // 2, self.y + self.h // 2)
 
     def overlaps(self, other: "DifferenceRegion", padding: int = 15) -> bool:
         """
-        Would this box sit on top of another box (or too close)?
+        True if this box overlaps `other` (counting a few extra pixels of padding).
 
-        We inflate *this* region by `padding` pixels on each side when checking. That way
-        two differences aren't jammed right next to each other — a bit of breathing room
-        makes the game fairer and the image less of a mess.
+        Padding stops two differences from spawning right on top of each other, which
+        would be unfair and look messy.
         """
         left_a = self.x - padding
         right_a = self.x + self.w + padding
@@ -49,15 +60,13 @@ class DifferenceRegion:
         right_b = other.x + other.w
         top_b = other.y
         bottom_b = other.y + other.h
-        # Classic "two rectangles intersect" logic — if they don't overlap, return False.
         return not (right_a < left_b or right_b < left_a or bottom_a < top_b or bottom_b < top_a)
 
     def contains_click(self, px: int, py: int, tolerance: int = 18) -> bool:
         """
-        Did the player click inside (or near) this region?
+        True if (px, py) falls inside the region, with a bit of slack.
 
-        We use tolerance because clicks are chunky — nobody hits the exact pixel. So we
-        pretend the box is a little bigger than it really is for hit-testing only.
+        Mouse clicks aren’t pixel-perfect; tolerance grows the hit box for gameplay feel.
         """
         return (
             self.x - tolerance <= px <= self.x + self.w + tolerance
@@ -65,30 +74,32 @@ class DifferenceRegion:
         )
 
 
-# DifferenceOperation — the OOP "template" for any kind of image tweak
-# This is an abstract base class: you never instantiate DifferenceOperation itself.
-# You subclass it and implement apply(). The engine then picks random subclasses and
-# calls .apply() — that's polymorphism (same method name, different behaviour).
+# =============================================================================
+# SECTION 2 — DifferenceOperation (abstract “recipe” for one kind of visual tweak)
+# =============================================================================
+# Inheritance + polymorphism: the engine holds a list of operation objects and calls
+# .apply() without caring which concrete class it is.
 
 
 class DifferenceOperation(ABC):
+    """Subclass this for each effect type; never instantiate this base class directly."""
+
     @abstractmethod
     def apply(self, image: np.ndarray, region: DifferenceRegion) -> None:
-        """Actually change the pixels inside `region` on `image` (BGR numpy array)."""
+        """Mutate `image` inside the rectangle `region` (BGR uint8 array)."""
         raise NotImplementedError
 
     @abstractmethod
     def name(self) -> str:
-        """Human-readable name — useful if you ever want to debug or log what ran."""
+        """Short label — handy for debugging or future logging."""
         raise NotImplementedError
 
 
 class ColorShiftOperation(DifferenceOperation):
     """
-    Normal mode: slap a coloured tint over the patch.
+    Normal mode: random colour tint blended over the patch.
 
-    We blend the original patch with a random solid colour at 45% strength. That tends
-    to read as "that chunk looks wrong" without needing to explain hue/saturation math.
+    45% blend with a random BGR tint — usually obvious when you compare left vs right.
     """
 
     def apply(self, image: np.ndarray, region: DifferenceRegion) -> None:
@@ -112,11 +123,7 @@ class ColorShiftOperation(DifferenceOperation):
 
 
 class BlurPatchOperation(DifferenceOperation):
-    """
-    Normal mode: Gaussian blur — the area goes soft and dreamy compared to the original.
-
-    OpenCV does the heavy lifting; bigger kernel = more obvious blur.
-    """
+    """Normal mode: Gaussian blur — patch goes soft while the rest stays sharp."""
 
     def apply(self, image: np.ndarray, region: DifferenceRegion) -> None:
         patch = image[region.y : region.y + region.h, region.x : region.x + region.w]
@@ -129,12 +136,7 @@ class BlurPatchOperation(DifferenceOperation):
 
 
 class NoisePatchOperation(DifferenceOperation):
-    """
-    Normal mode: sprinkle random +/- brightness on each pixel.
-
-    Looks grainy / staticky. Fine detail (grass, water) can hide it a bit, but next to
-    the original it's usually visible.
-    """
+    """Normal mode: add random per-pixel noise — looks grainy / static-y."""
 
     def apply(self, image: np.ndarray, region: DifferenceRegion) -> None:
         patch = image[region.y : region.y + region.h, region.x : region.x + region.w]
@@ -148,11 +150,7 @@ class NoisePatchOperation(DifferenceOperation):
 
 
 class InvertPatchOperation(DifferenceOperation):
-    """
-    Easy mode: photographic negative inside the box (255 - pixel).
-
-    Hard to miss — great for demos or when you want the player to win fast.
-    """
+    """Easy mode: invert colours (255 - pixel) — very hard to miss."""
 
     def apply(self, image: np.ndarray, region: DifferenceRegion) -> None:
         patch = image[region.y : region.y + region.h, region.x : region.x + region.w]
@@ -164,10 +162,9 @@ class InvertPatchOperation(DifferenceOperation):
 
 class PixelatePatchOperation(DifferenceOperation):
     """
-    Easy mode: Minecraft / mosaic look.
+    Easy mode: chunky “minecraft” blocks.
 
-    Trick: shrink the patch to tiny, then blow it back up with nearest-neighbour so you
-    get chunky blocks instead of smooth pixels.
+    Shrink patch → resize back up with nearest-neighbour so pixels snap to a grid.
     """
 
     def apply(self, image: np.ndarray, region: DifferenceRegion) -> None:
@@ -184,12 +181,7 @@ class PixelatePatchOperation(DifferenceOperation):
 
 
 class BrightnessTintOperation(DifferenceOperation):
-    """
-    Easy mode: push hue / saturation / value in HSV space then convert back to BGR.
-
-    Reads as "that patch is the wrong colour AND too bright" — very obvious next to
-    the untouched original.
-    """
+    """Easy mode: big hue/sat/value push in HSV then convert back to BGR — loud colour shift."""
 
     def apply(self, image: np.ndarray, region: DifferenceRegion) -> None:
         patch = image[region.y : region.y + region.h, region.x : region.x + region.w]
@@ -204,15 +196,18 @@ class BrightnessTintOperation(DifferenceOperation):
         return "Brightness Tint"
 
 
-
-# ImageDifferenceEngine — load image, clone it, carve out 5 regions, apply ops
-# Flow for someone reading top-to-bottom:
-# 1. Optional seed (if you ever want reproducible randomness for testing).
-# 2. set_mode("Normal" or "Easy") swaps which three operation classes we use.
-# 3. load_and_generate(path) reads disk, copies pixels, builds regions, runs apply().
+# =============================================================================
+# SECTION 3 — ImageDifferenceEngine (file I/O + random placement + calling operations)
+# =============================================================================
 
 
 class ImageDifferenceEngine:
+    """
+    Owns the original BGR image, the modified clone, and the list of DifferenceRegions.
+
+    Normal vs Easy mode swaps which three operation classes get instantiated — see set_mode.
+    """
+
     def __init__(self, rng_seed: Optional[int] = None) -> None:
         self._rng_seed = rng_seed
         if rng_seed is not None:
@@ -227,14 +222,14 @@ class ImageDifferenceEngine:
 
     @property
     def mode(self) -> str:
-        """Which flavour we're in — GUI shows this after load."""
+        """\"Normal\" or \"Easy\" — the GUI prints this after a successful load."""
         return self._mode
 
     def set_mode(self, mode: str) -> None:
         """
-        Called from the GUI before loading. Accepts "Easy" / "easy" / "easy mode" etc.
+        Call this before load_and_generate. Accepts \"easy\", \"Easy\", \"easy mode\", etc.
 
-        We normalise to "Easy" or "Normal" internally so the rest of the code stays simple.
+        Anything that doesn’t look like easy → treated as Normal.
         """
         normalized = (mode or "").strip().lower()
         if normalized in ("easy", "easy mode"):
@@ -244,7 +239,7 @@ class ImageDifferenceEngine:
         self._operations = self._operations_for_mode(self._mode)
 
     def _operations_for_mode(self, mode: str) -> Sequence[DifferenceOperation]:
-        """Pick the trio of operation objects for this mode (new instances each time)."""
+        """Fresh instances each time — keeps behaviour simple and stateless per op."""
         if mode == "Easy":
             return (
                 InvertPatchOperation(),
@@ -271,15 +266,14 @@ class ImageDifferenceEngine:
 
     @property
     def regions(self) -> List[DifferenceRegion]:
-        """The five (or however many) hidden boxes — GUI uses this for clicks and drawing."""
+        """Empty until load_and_generate succeeds; then length == total_differences (5)."""
         return self._regions
 
     def load_and_generate(self, image_path: str, total_differences: int = 5) -> None:
         """
-        The main event: read file, validate size, clone, scatter differences.
+        Load from disk, sanity-check size, clone to modified, spawn regions, apply effects.
 
-        We shuffle the operation list then cycle through it so you don't randomly get
-        five blurs in a row (which would be boring / hard to tell apart).
+        We shuffle the op list then cycle so you don’t accidentally get five identical effects.
         """
         image = cv2.imread(image_path)
         if image is None:
@@ -300,15 +294,16 @@ class ImageDifferenceEngine:
 
     def _create_non_overlapping_regions(self, width: int, height: int, count: int) -> List[DifferenceRegion]:
         """
-        Throw darts at random rectangles until we have `count` that don't overlap.
+        Randomly propose rectangles until `count` non-overlapping ones exist.
 
-        If the image is weird or tiny we might fail after max_attempts — then we bail
-        with a clear error so the GUI can show a dialog instead of hanging forever.
+        Gives up after max_attempts with a ValueError so the GUI can show a friendly dialog
+        instead of spinning forever on a pathological image.
         """
         created: List[DifferenceRegion] = []
         attempts = 0
         max_attempts = 4000
 
+        # Bigger min/max than tiny thumbnails — differences easier to see and click.
         min_size = max(36, min(width, height) // 9)
         max_size = max(min_size + 12, min(width, height) // 4)
 
@@ -330,11 +325,14 @@ class ImageDifferenceEngine:
         return created
 
 
-# GameStats — boring but important: how many wrong clicks, how many found overall
-# Kept separate from the engine on purpose: image stuff vs score stuff = cleaner design.
+# =============================================================================
+# SECTION 4 — GameStats (scoreboard stuff, no OpenCV here)
+# =============================================================================
 
 
 class GameStats:
+    """Tracks lifetime \"total found\" plus per-image mistakes (max 3)."""
+
     def __init__(self) -> None:
         self._total_found = 0
         self._images_played = 0
@@ -343,16 +341,17 @@ class GameStats:
 
     @property
     def total_found(self) -> int:
-        """Lifetime counter across multiple loaded images (assignment asked for cumulative)."""
+        """Never reset by this class — grows across multiple images you load."""
         return self._total_found
 
     @property
     def images_played(self) -> int:
+        """Incremented each time you start a new image (even if you quit early)."""
         return self._images_played
 
     @property
     def mistakes(self) -> int:
-        """Wrong clicks *this* round only — resets when you load a new picture."""
+        """Wrong clicks on the *current* image only."""
         return self._mistakes_current_image
 
     @property
@@ -366,28 +365,27 @@ class GameStats:
         self._mistakes_current_image += 1
 
     def reset_for_new_image(self) -> None:
-        """New image = new mistake budget, but we bump images_played for stats nerds."""
+        """Call when user loads a new picture: fresh mistake budget, bump images_played."""
         self._images_played += 1
         self._mistakes_current_image = 0
 
     def guesses_allowed(self) -> bool:
-        """False once you've burned through 3 misses — GUI should ignore further clicks."""
+        """Once mistakes hit 3, the GUI should ignore further click attempts."""
         return self._mistakes_current_image < self._max_mistakes
 
-"""
-GUI composition and display helper methods.
 
-- This draws the window: buttons up top, two big image areas side by side.
-
-"""
-
+# =============================================================================
+# SECTION 5 — SpotTheDifferenceView (Tk layout + image scaling + resize hooks)
+# =============================================================================
+# This class used to be “Part 2” in a split project. The subclass below overrides the three
+# stub methods at the bottom with real behaviour.
 
 
 class SpotTheDifferenceView:
     """
-    Base window class — builds widgets and knows how to resize/draw images.
+    Builds the toolbar + two canvases, keeps display buffers in sync with window size.
 
-    Subclass adds: picking a file, reacting to clicks, win/lose popups.
+    Subclass responsibility: load_image, reveal_unfound, _on_modified_click (implemented in App).
     """
 
     def __init__(self, root: tk.Tk) -> None:
@@ -396,38 +394,42 @@ class SpotTheDifferenceView:
         self.root.geometry("1320x760")
         self.root.minsize(1040, 640)
 
-        # These two are the "model" — engine = pictures + hidden boxes, stats = score.
+        # “Model” objects — no Tk widgets inside them, just data + OpenCV arrays.
         self.engine = ImageDifferenceEngine()
         self.stats = GameStats()
 
-        # After we resize images to fit the canvas, we need to map click coords back to
-        # full-resolution image coords — _scale_x/_scale_y do that (set in _prepare_display_pair).
+        # Smaller numpy copies actually painted on screen; _scale_* maps canvas coords → full image.
         self._display_original: Optional[np.ndarray] = None
         self._display_modified: Optional[np.ndarray] = None
         self._scale_x: float = 1.0
         self._scale_y: float = 1.0
         self._can_guess = False
 
-        # Tkinter quirk: you must keep a reference to PhotoImage or it gets garbage-collected
-        # and you get a blank canvas. Hence these instance attributes.
+        # Must hold PhotoImage references or Tk silently drops them → blank canvases.
         self._photo_left = None
         self._photo_right = None
+
+        # Bitmap top-left on the *right* canvas (where clicks matter); updated in _draw_canvas_images.
+        self._img_off_x = 0
+        self._img_off_y = 0
+
+        # after() job id for debouncing resize redraws (fullscreen fires tons of Configure events).
+        self._resize_job: Optional[str] = None
 
         self._build_ui()
         self._refresh_labels()
 
     def _build_ui(self) -> None:
-        """Pack all the controls and canvases — order matters for left-to-right layout."""
+        """Lay out widgets: top bar first, then two equal columns for original vs modified."""
         control_frame = tk.Frame(self.root, padx=8, pady=8)
         control_frame.pack(fill="x")
 
-        load_btn = tk.Button(control_frame, text="Load Image", command=self.load_image, width=14)
-        load_btn.pack(side="left", padx=4)
+        tk.Button(control_frame, text="Load Image", command=self.load_image, width=14).pack(side="left", padx=4)
+        tk.Button(control_frame, text="Reveal Unfound", command=self.reveal_unfound, width=14).pack(
+            side="left", padx=4
+        )
 
-        reveal_btn = tk.Button(control_frame, text="Reveal Unfound", command=self.reveal_unfound, width=14)
-        reveal_btn.pack(side="left", padx=4)
-
-        # StringVar ties the dropdown to actual Python string state, .get() on load.
+        # Dropdown writes into mode_var; load_image reads it before generating differences.
         self.mode_var = tk.StringVar(value="Normal")
         tk.Label(control_frame, text="Mode:", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(14, 4))
         mode_menu = tk.OptionMenu(control_frame, self.mode_var, "Normal", "Easy")
@@ -446,7 +448,7 @@ class SpotTheDifferenceView:
         self.label_message = tk.Label(control_frame, text="Load an image to begin.", fg="navy")
         self.label_message.pack(side="left", padx=14)
 
-        # Below the toolbar: two columns that grow with the window (expand=True).
+        # expand=True so maximizing the window grows these frames (and thus the canvases).
         images_frame = tk.Frame(self.root, padx=8, pady=8)
         images_frame.pack(fill="both", expand=True)
 
@@ -461,13 +463,47 @@ class SpotTheDifferenceView:
         self.canvas_left = tk.Canvas(left_panel, bg="#e8e8e8", cursor="arrow")
         self.canvas_left.pack(fill="both", expand=True, padx=(0, 6))
 
-        # Crosshair cursor hints "this is the interactive side".
         self.canvas_right = tk.Canvas(right_panel, bg="#e8e8e8", cursor="crosshair")
         self.canvas_right.pack(fill="both", expand=True, padx=(6, 0))
         self.canvas_right.bind("<Button-1>", self._on_modified_click)
 
+        # Any resize on either pane triggers a debounced redraw (only matters once an image is loaded).
+        self.canvas_left.bind("<Configure>", self._on_canvas_configure)
+        self.canvas_right.bind("<Configure>", self._on_canvas_configure)
+
+    def _on_canvas_configure(self, _event: tk.Event) -> None:
+        """Fires when canvas size changes — schedule a single redraw after things settle."""
+        if not self.engine.regions:
+            return
+        if self._resize_job is not None:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(120, self._finish_canvas_resize)
+
+    def _finish_canvas_resize(self) -> None:
+        """Runs on the timer: ask subclass to redraw if it implemented _redraw_images."""
+        self._resize_job = None
+        if not self.engine.regions:
+            return
+        redraw = getattr(self, "_redraw_images", None)
+        if callable(redraw):
+            redraw()
+
+    def _get_canvas_display_limits(self) -> Tuple[int, int]:
+        """
+        Return (max_width, max_height) for the scaled photo inside one canvas.
+
+        Uses live winfo_* so fullscreen works. Tiny values early in startup → safe fallback.
+        """
+        self.root.update_idletasks()
+        margin = 24
+        cw = self.canvas_right.winfo_width()
+        ch = self.canvas_right.winfo_height()
+        if cw < 80 or ch < 80:
+            return (620, 620)
+        return (max(1, cw - margin), max(1, ch - margin))
+
     def _refresh_labels(self) -> None:
-        """Sync text labels with whatever the engine/stats currently say — call after any game event."""
+        """Call after anything changes found/mistake state so the top bar stays truthful."""
         remaining = 0
         if self.engine.regions:
             remaining = sum(1 for r in self.engine.regions if not r.found)
@@ -477,31 +513,40 @@ class SpotTheDifferenceView:
         self.label_total.config(text=f"Total Found: {self.stats.total_found}")
 
     def _prepare_display_pair(
-        self, left_img: np.ndarray, right_img: np.ndarray, max_w: int = 620, max_h: int = 620
+        self,
+        left_img: np.ndarray,
+        right_img: np.ndarray,
+        max_w: Optional[int] = None,
+        max_h: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Shrink both images by the same factor so they fit the canvas without stretching weirdly.
+        Resize both full-res images identically so they still line up side by side.
 
-        We also stash _scale_x/_scale_y so clicks on the canvas can be multiplied back to
-        "real" image coordinates. The 12-pixel offset in part 3 matches create_image(12,12,...).
+        Important: we do NOT cap scale at 1.0 anymore — small photos can grow to fill a
+        large monitor. INTER_AREA looks nicer when shrinking; INTER_LINEAR when enlarging.
         """
+        if max_w is None or max_h is None:
+            max_w, max_h = self._get_canvas_display_limits()
+
         h, w = left_img.shape[:2]
-        scale = min(max_w / w, max_h / h, 1.0)
+        scale = min(max_w / w, max_h / h)
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
 
+        # How many full-res pixels correspond to one on-screen pixel (for click mapping).
         self._scale_x = w / new_w
         self._scale_y = h / new_h
 
-        resized_left = cv2.resize(left_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        resized_right = cv2.resize(right_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized_left = cv2.resize(left_img, (new_w, new_h), interpolation=interp)
+        resized_right = cv2.resize(right_img, (new_w, new_h), interpolation=interp)
         return resized_left, resized_right
 
     def _draw_canvas_images(self) -> None:
         """
-        Push numpy BGR arrays onto the canvases as Tk PhotoImages.
+        Convert BGR numpy → RGB PhotoImage, center each image inside its canvas, remember offsets.
 
-        OpenCV lives in BGR land; Tkinter/PIL want RGB — hence cvtColor.
+        _img_off_* must match where we paint on the right canvas or click detection drifts.
         """
         if self._display_original is None or self._display_modified is None:
             return
@@ -514,16 +559,22 @@ class SpotTheDifferenceView:
 
         self.canvas_left.delete("all")
         self.canvas_right.delete("all")
-        self.canvas_left.create_image(12, 12, anchor="nw", image=self._photo_left)
-        self.canvas_right.create_image(12, 12, anchor="nw", image=self._photo_right)
+
+        # shape[:2] is (height, width) in numpy row-major order — don’t mix them up.
+        disp_h, disp_w = self._display_original.shape[:2]
+        lx = max(0, (self.canvas_left.winfo_width() - disp_w) // 2)
+        ly = max(0, (self.canvas_left.winfo_height() - disp_h) // 2)
+        rx = max(0, (self.canvas_right.winfo_width() - disp_w) // 2)
+        ry = max(0, (self.canvas_right.winfo_height() - disp_h) // 2)
+        self._img_off_x, self._img_off_y = rx, ry
+
+        self.canvas_left.create_image(lx, ly, anchor="nw", image=self._photo_left)
+        self.canvas_right.create_image(rx, ry, anchor="nw", image=self._photo_right)
 
         self.canvas_left.config(scrollregion=self.canvas_left.bbox("all"))
         self.canvas_right.config(scrollregion=self.canvas_right.bbox("all"))
 
-    # -------------------------------------------------------------------------
-    # Stubs — subclass replaces these with real implementations.
-    # If you accidentally run THIS file as main, you'd hit these — run part 3 instead.
-    # -------------------------------------------------------------------------
+    # --- Stubs: subclass (SpotTheDifferenceApp) replaces these with real code ---
 
     def load_image(self) -> None:
         raise NotImplementedError
@@ -535,27 +586,24 @@ class SpotTheDifferenceView:
         raise NotImplementedError
 
 
-"""
-Interaction logic, round flow, and executable app entry.
-
-
-- We subclass `SpotTheDifferenceView` and finally implement the three methods that were
-  stubbed out: load a file, handle clicks, reveal answers, show popups when you win or
-  run out of mistakes.
-"""
-
+# =============================================================================
+# SECTION 6 — SpotTheDifferenceApp (gameplay: subclass of the View above)
+# =============================================================================
 
 
 class SpotTheDifferenceApp(SpotTheDifferenceView):
+    """
+    Everything that makes the game actually playable lives here.
 
+    Inherits all layout/scaling from SpotTheDifferenceView; overrides the three stubs.
+    """
 
     def load_image(self) -> None:
         """
-        Open a file picker, then tell the engine to load + bake in 5 differences.
+        File dialog → engine loads + generates 5 differences.
 
-        Order matters: set_mode first so load_and_generate uses Normal vs Easy 
-        If anything doesnt work (bad path, tiny image, couldn't place 5 boxes), we show
-        an error dialog and exit without half-updating the UI.
+        set_mode runs first so the engine knows Normal vs Easy before touching pixels.
+        On failure we show a messagebox and return without touching round state.
         """
         image_path = filedialog.askopenfilename(
             title="Select an image",
@@ -579,11 +627,9 @@ class SpotTheDifferenceApp(SpotTheDifferenceView):
 
     def _redraw_images(self) -> None:
         """
-        Copy fresh pixels from the engine, draw circles on TOP for found/revealed spots,
-        then resize for display.
+        Always work on copies — we draw hint circles for display only, not on engine buffers.
 
-        Why copy? We don't want to permanently draw circles on the engine's internal
-        arrays — those are the "source of truth" for the round. We only decorate for display.
+        Flow: copy originals → draw circles in full-res coords → downscale for canvas → paint.
         """
         original = self.engine.original.copy()
         modified = self.engine.modified.copy()
@@ -592,11 +638,11 @@ class SpotTheDifferenceApp(SpotTheDifferenceView):
             cx, cy = region.center()
             radius = int(max(region.w, region.h) * 0.55)
             if region.found:
-                # BGR: red = (0,0,255) in OpenCV's backwards channel order
+                # OpenCV uses BGR order: “red” is (0, 0, 255).
                 cv2.circle(original, (cx, cy), radius, (0, 0, 255), 2)
                 cv2.circle(modified, (cx, cy), radius, (0, 0, 255), 2)
             elif region.revealed:
-                # Blue-ish for "you cheated / reveal button" — still BGR so (255,0,0) is blue
+                # BGR blue is (255, 0, 0) — yes, it’s backwards from what you’d guess.
                 cv2.circle(original, (cx, cy), radius, (255, 0, 0), 2)
                 cv2.circle(modified, (cx, cy), radius, (255, 0, 0), 2)
 
@@ -605,17 +651,15 @@ class SpotTheDifferenceApp(SpotTheDifferenceView):
 
     def _on_modified_click(self, event: tk.Event) -> None:
         """
-        Translate canvas click → image pixel, see if it hit a hidden region.
+        Map canvas (event.x, event.y) → full image coords, then ask regions for a hit.
 
-        The `- 12` matches where we painted the image (offset from canvas edge). If you
-        ever change that offset in part 2's _draw_canvas_images, update it here too or
-        clicks will feel "off".
+        Subtract _img_off_* first because the bitmap might be centered with empty margin.
         """
         if not self.engine.regions or not self._can_guess or not self.stats.guesses_allowed():
             return
 
-        img_x = int((event.x - 12) * self._scale_x)
-        img_y = int((event.y - 12) * self._scale_y)
+        img_x = int((event.x - self._img_off_x) * self._scale_x)
+        img_y = int((event.y - self._img_off_y) * self._scale_y)
         if img_x < 0 or img_y < 0:
             return
 
@@ -639,10 +683,9 @@ class SpotTheDifferenceApp(SpotTheDifferenceView):
 
     def _check_end_conditions(self) -> None:
         """
-        Win: zero remaining unfound → popup + lock guesses.
-        Lose the round: 3 misses → popup with how many you got, lock guesses.
+        Win: zero unfound → congrats + lock input.
 
-        "Lock guesses" = _can_guess False so further clicks are ignored until new image.
+        Lose: 3 mistakes → warning + lock input. Either way _can_guess blocks further clicks.
         """
         remaining = sum(1 for r in self.engine.regions if not r.found)
 
@@ -663,8 +706,9 @@ class SpotTheDifferenceApp(SpotTheDifferenceView):
 
     def reveal_unfound(self) -> None:
         """
-        Spoiler button: mark every still-hidden region as revealed, redraw with blue rings,
-        and stop counting further clicks as valid guesses.
+        Cheat sheet: mark all still-hidden regions as revealed, draw blue rings, stop guessing.
+
+        Player is expected to load a new image if they want a clean round after this.
         """
         if not self.engine.regions:
             return
@@ -682,7 +726,7 @@ class SpotTheDifferenceApp(SpotTheDifferenceView):
 
 
 def main() -> None:
-    """Standard Tk entry: one root window, one app object, hand control to the event loop."""
+    """Entry point: create Tk root, construct app (must keep reference!), start mainloop."""
     root = tk.Tk()
     app = SpotTheDifferenceApp(root)
     root.mainloop()
