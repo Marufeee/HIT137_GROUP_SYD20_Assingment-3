@@ -374,3 +374,178 @@ class GameStats:
         """False once you've burned through 3 misses — GUI should ignore further clicks."""
         return self._mistakes_current_image < self._max_mistakes
 
+"""
+GUI composition and display helper methods.
+
+- This draws the window: buttons up top, two big image areas side by side.
+- It does NOT know how to open a file dialog or handle clicks end-to-end — 
+- Think of `SpotTheDifferenceView` as a skeleton: the bones exist, but `load_image`,
+  `reveal_unfound`, and `_on_modified_click` are still incomplete
+
+Dependency note:
+- We import `GameStats` and `ImageDifferenceEngine` . Those objects hold
+  all the actual game data; this class just displays them and forwards user actions.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
+import tkinter as tk
+from PIL import Image, ImageTk
+
+from project_part1_65 import GameStats, ImageDifferenceEngine
+
+
+class SpotTheDifferenceView:
+    """
+    Base window class — builds widgets and knows how to resize/draw images.
+
+    Subclass adds: picking a file, reacting to clicks, win/lose popups.
+    """
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("Spot the Difference - HIT137")
+        self.root.geometry("1320x760")
+        self.root.minsize(1040, 640)
+
+        # These two are the "model" — engine = pictures + hidden boxes, stats = score.
+        self.engine = ImageDifferenceEngine()
+        self.stats = GameStats()
+
+        # After we resize images to fit the canvas, we need to map click coords back to
+        # full-resolution image coords — _scale_x/_scale_y do that (set in _prepare_display_pair).
+        self._display_original: Optional[np.ndarray] = None
+        self._display_modified: Optional[np.ndarray] = None
+        self._scale_x: float = 1.0
+        self._scale_y: float = 1.0
+        self._can_guess = False
+
+        # Tkinter quirk: you must keep a reference to PhotoImage or it gets garbage-collected
+        # and you get a blank canvas. Hence these instance attributes.
+        self._photo_left = None
+        self._photo_right = None
+
+        self._build_ui()
+        self._refresh_labels()
+
+    def _build_ui(self) -> None:
+        """Pack all the controls and canvases — order matters for left-to-right layout."""
+        control_frame = tk.Frame(self.root, padx=8, pady=8)
+        control_frame.pack(fill="x")
+
+        load_btn = tk.Button(control_frame, text="Load Image", command=self.load_image, width=14)
+        load_btn.pack(side="left", padx=4)
+
+        reveal_btn = tk.Button(control_frame, text="Reveal Unfound", command=self.reveal_unfound, width=14)
+        reveal_btn.pack(side="left", padx=4)
+
+        # StringVar ties the dropdown to actual Python string state, .get() on load.
+        self.mode_var = tk.StringVar(value="Normal")
+        tk.Label(control_frame, text="Mode:", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(14, 4))
+        mode_menu = tk.OptionMenu(control_frame, self.mode_var, "Normal", "Easy")
+        mode_menu.config(width=8)
+        mode_menu.pack(side="left", padx=(0, 14))
+
+        self.label_remaining = tk.Label(control_frame, text="Remaining: -", font=("Segoe UI", 11, "bold"))
+        self.label_remaining.pack(side="left", padx=14)
+
+        self.label_mistakes = tk.Label(control_frame, text="Mistakes: 0 / 3", font=("Segoe UI", 11))
+        self.label_mistakes.pack(side="left", padx=14)
+
+        self.label_total = tk.Label(control_frame, text="Total Found: 0", font=("Segoe UI", 11))
+        self.label_total.pack(side="left", padx=14)
+
+        self.label_message = tk.Label(control_frame, text="Load an image to begin.", fg="navy")
+        self.label_message.pack(side="left", padx=14)
+
+        # Below the toolbar: two columns that grow with the window (expand=True).
+        images_frame = tk.Frame(self.root, padx=8, pady=8)
+        images_frame.pack(fill="both", expand=True)
+
+        left_panel = tk.Frame(images_frame)
+        left_panel.pack(side="left", fill="both", expand=True)
+        right_panel = tk.Frame(images_frame)
+        right_panel.pack(side="left", fill="both", expand=True)
+
+        tk.Label(left_panel, text="Original (Reference)", font=("Segoe UI", 10, "bold")).pack(pady=(0, 6))
+        tk.Label(right_panel, text="Modified (Click Here)", font=("Segoe UI", 10, "bold")).pack(pady=(0, 6))
+
+        self.canvas_left = tk.Canvas(left_panel, bg="#e8e8e8", cursor="arrow")
+        self.canvas_left.pack(fill="both", expand=True, padx=(0, 6))
+
+        # Crosshair cursor hints "this is the interactive side".
+        self.canvas_right = tk.Canvas(right_panel, bg="#e8e8e8", cursor="crosshair")
+        self.canvas_right.pack(fill="both", expand=True, padx=(6, 0))
+        self.canvas_right.bind("<Button-1>", self._on_modified_click)
+
+    def _refresh_labels(self) -> None:
+        """Sync text labels with whatever the engine/stats currently say — call after any game event."""
+        remaining = 0
+        if self.engine.regions:
+            remaining = sum(1 for r in self.engine.regions if not r.found)
+
+        self.label_remaining.config(text=f"Remaining: {remaining}")
+        self.label_mistakes.config(text=f"Mistakes: {self.stats.mistakes} / {self.stats.max_mistakes}")
+        self.label_total.config(text=f"Total Found: {self.stats.total_found}")
+
+    def _prepare_display_pair(
+        self, left_img: np.ndarray, right_img: np.ndarray, max_w: int = 620, max_h: int = 620
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Shrink both images by the same factor so they fit the canvas without stretching weirdly.
+
+        We also stash _scale_x/_scale_y so clicks on the canvas can be multiplied back to
+        "real" image coordinates. The 12-pixel offset in part 3 matches create_image(12,12,...).
+        """
+        h, w = left_img.shape[:2]
+        scale = min(max_w / w, max_h / h, 1.0)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+
+        self._scale_x = w / new_w
+        self._scale_y = h / new_h
+
+        resized_left = cv2.resize(left_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        resized_right = cv2.resize(right_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return resized_left, resized_right
+
+    def _draw_canvas_images(self) -> None:
+        """
+        Push numpy BGR arrays onto the canvases as Tk PhotoImages.
+
+        OpenCV lives in BGR land; Tkinter/PIL want RGB — hence cvtColor.
+        """
+        if self._display_original is None or self._display_modified is None:
+            return
+
+        left_rgb = cv2.cvtColor(self._display_original, cv2.COLOR_BGR2RGB)
+        right_rgb = cv2.cvtColor(self._display_modified, cv2.COLOR_BGR2RGB)
+
+        self._photo_left = ImageTk.PhotoImage(Image.fromarray(left_rgb))
+        self._photo_right = ImageTk.PhotoImage(Image.fromarray(right_rgb))
+
+        self.canvas_left.delete("all")
+        self.canvas_right.delete("all")
+        self.canvas_left.create_image(12, 12, anchor="nw", image=self._photo_left)
+        self.canvas_right.create_image(12, 12, anchor="nw", image=self._photo_right)
+
+        self.canvas_left.config(scrollregion=self.canvas_left.bbox("all"))
+        self.canvas_right.config(scrollregion=self.canvas_right.bbox("all"))
+
+    # -------------------------------------------------------------------------
+    # Stubs — subclass replaces these with real implementations.
+    # If you accidentally run THIS file as main, you'd hit these — run part 3 instead.
+    # -------------------------------------------------------------------------
+
+    def load_image(self) -> None:
+        raise NotImplementedError
+
+    def reveal_unfound(self) -> None:
+        raise NotImplementedError
+
+    def _on_modified_click(self, event: tk.Event) -> None:
+        raise NotImplementedError
