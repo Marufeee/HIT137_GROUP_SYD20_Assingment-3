@@ -378,25 +378,9 @@ class GameStats:
 GUI composition and display helper methods.
 
 - This draws the window: buttons up top, two big image areas side by side.
-- It does NOT know how to open a file dialog or handle clicks end-to-end — 
-- Think of `SpotTheDifferenceView` as a skeleton: the bones exist, but `load_image`,
-  `reveal_unfound`, and `_on_modified_click` are still incomplete
 
-Dependency note:
-- We import `GameStats` and `ImageDifferenceEngine` . Those objects hold
-  all the actual game data; this class just displays them and forwards user actions.
 """
 
-from __future__ import annotations
-
-from typing import Optional, Tuple
-
-import cv2
-import numpy as np
-import tkinter as tk
-from PIL import Image, ImageTk
-
-from project_part1_65 import GameStats, ImageDifferenceEngine
 
 
 class SpotTheDifferenceView:
@@ -560,21 +544,10 @@ Interaction logic, round flow, and executable app entry.
   run out of mistakes.
 """
 
-from __future__ import annotations
-
-from pathlib import Path
-
-import cv2
-import tkinter as tk
-from tkinter import filedialog, messagebox
-
-from project_part2_17_5 import SpotTheDifferenceView
 
 
 class SpotTheDifferenceApp(SpotTheDifferenceView):
-    """
-    The playable app — same UI as the parent, but now buttons actually do things.
-    """
+
 
     def load_image(self) -> None:
         """
