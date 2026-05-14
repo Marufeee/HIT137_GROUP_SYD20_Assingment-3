@@ -1,12 +1,48 @@
 """
+Spot the Difference Game - HIT137 Assignment 3
+
 How the code is organised (read top → bottom):
-    1) DifferenceRegion          — one hidden “spot” as a rectangle + found/reveal flags
-    2) DifferenceOperation + subclasses — OpenCV tricks that change a patch (OOP / polymorphism)
-    3) ImageDifferenceEngine     — load image, clone it, place 5 non-overlapping regions, apply ops
-    4) GameStats                  — mistakes + total found (kept separate from pixels on purpose)
-    5) SpotTheDifferenceView      — Tk window, labels, canvases, scaling + fullscreen resize logic
-    6) SpotTheDifferenceApp       — subclass: file picker, clicks, win/lose, reveal button
-    7) main()                     — boots Tk and starts the event loop
+    1) Constants and type aliases — easy-to-change settings used across the program
+    2) DifferenceRegion          — one hidden “spot” as a rectangle + found/reveal flags
+    3) DifferenceOperation + subclasses — OpenCV tricks that change a patch (OOP / polymorphism)
+    4) ImageDifferenceEngine     — load image, clone it, place 5 non-overlapping regions, apply ops
+    5) GameStats                 — mistakes + total found (kept separate from pixels on purpose)
+    6) SpotTheDifferenceView     — Tk window, labels, canvases, scaling + fullscreen resize logic
+    7) SpotTheDifferenceApp      — subclass: file picker, clicks, win/lose, reveal button
+    8) main()                    — boots Tk and starts the event loop
+
+Program Flow:
+    1) User loads an image.
+    2) The engine creates random non-overlapping regions.
+    3) DifferenceOperation subclasses modify only those selected regions.
+    4) Original and modified images are shown side-by-side.
+    5) User clicks the modified image to find differences.
+    6) GameStats updates remaining differences, total found, and mistakes.
+    7) The reveal button highlights unfound regions and ends the current round.
+
+OOP Concepts Used:
+    - Encapsulation: each class manages its own data and behaviour.
+    - Abstraction: DifferenceOperation defines a common interface for all effects.
+    - Inheritance: each operation class inherits from DifferenceOperation.
+    - Polymorphism: the engine calls apply() without knowing which effect class is used.
+    - Separation of Concerns: image processing, game stats, and UI logic are separated.
+
+Class Relationships:
+    SpotTheDifferenceApp  → inherits from → SpotTheDifferenceView
+    ImageDifferenceEngine → uses         → DifferenceOperation subclasses
+    GameStats             → stores       → gameplay statistics
+    DifferenceRegion      → stores       → geometry and click-hit testing data
+
+Features:
+    - Random non-overlapping differences
+    - Two difficulty modes: Normal and Easy
+    - Dynamic image scaling while keeping aspect ratio
+    - Click detection with tolerance
+    - Red circles for found differences
+    - Blue circles for revealed differences
+    - Mistake tracking and lockout after maximum mistakes
+    - Resize/fullscreen support
+                  — boots Tk and starts the event loop
 """
 
 from __future__ import annotations
